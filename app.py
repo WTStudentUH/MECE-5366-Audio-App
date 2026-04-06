@@ -10,6 +10,7 @@ Original file is located at
 import streamlit as st
 import os
 import tempfile
+import zipfile
 import librosa
 import numpy as np
 import scipy.signal
@@ -26,7 +27,7 @@ from sklearn.metrics import accuracy_score, ConfusionMatrixDisplay
 # --- UI Setup ---
 st.set_page_config(page_title="HW3 Audio ML App", layout="wide")
 st.title("🎧 Audio Classification App")
-st.write("Upload your training data (HW3) and unseen test data (HW2). The app will process the audio, train the model, and evaluate performance across all sets.")
+st.write("Upload your zipped training data (A folder containing batch folder) and test data (only wav files). The app will extract the audio, train the model, and evaluate performance.")
 
 # --- HW3 Functions ---
 def split_and_save_hits(input_file, output_folder, top_db=25, min_hit_duration=0.05):
@@ -68,11 +69,15 @@ def create_dataset(folder_path):
             y.append(0) # Healthy
     return np.array(X), np.array(y)
 
-# --- Helper Function for File Saving ---
-def save_uploaded_files(uploaded_files, target_dir):
-    for uf in uploaded_files:
-        with open(os.path.join(target_dir, uf.name), "wb") as f:
-            f.write(uf.getbuffer())
+# --- Helper Function for ZIP finding ---
+def get_all_wav_paths(directory):
+    """Walks through extracted zip folders to find all .wav files."""
+    wav_paths = []
+    for root, _, files in os.walk(directory):
+        for file in files:
+            if file.lower().endswith('.wav'):
+                wav_paths.append(os.path.join(root, file))
+    return wav_paths
 
 # --- App Logic ---
 model_choice = st.selectbox("Select Machine Learning Model", ["KNN (K=3)", "Decision Tree", "Logistic Regression", "SVM"])
@@ -82,30 +87,33 @@ col_upload1, col_upload2 = st.columns(2)
 
 with col_upload1:
     st.subheader("1. Training Data")
-    train_files = st.file_uploader("Upload Training Data (e.g., HW3 files)", type=["wav"], accept_multiple_files=True, key="train")
+    train_zip = st.file_uploader("Upload Training Data (.zip)", type=["zip"], key="train")
 
 with col_upload2:
     st.subheader("2. Unseen Test Data")
-    test_files = st.file_uploader("Upload Unseen Data (e.g., HW2 files)", type=["wav"], accept_multiple_files=True, key="test")
+    test_zip = st.file_uploader("Upload Unseen Data (.zip)", type=["zip"], key="test")
 
-if train_files and test_files:
+if train_zip and test_zip:
     if st.button("Run Full ML Pipeline", type="primary"):
         st.write("---")
 
-        # Open temporary directories for all data
         with tempfile.TemporaryDirectory() as train_raw, tempfile.TemporaryDirectory() as train_proc, \
              tempfile.TemporaryDirectory() as test_raw, tempfile.TemporaryDirectory() as test_proc:
 
-            save_uploaded_files(train_files, train_raw)
-            save_uploaded_files(test_files, test_raw)
+            # Extract Zips
+            with zipfile.ZipFile(train_zip, 'r') as z:
+                z.extractall(train_raw)
+            with zipfile.ZipFile(test_zip, 'r') as z:
+                z.extractall(test_raw)
 
             # --- Step A: Process Training Data ---
             st.write("### ⚙️ Processing Training Data...")
             train_bar = st.progress(0)
-            train_files_list = os.listdir(train_raw)
-            for index, file in enumerate(train_files_list):
-                split_and_save_hits(os.path.join(train_raw, file), train_proc)
-                train_bar.progress((index + 1) / len(train_files_list))
+            train_wavs = get_all_wav_paths(train_raw)
+
+            for index, file_path in enumerate(train_wavs):
+                split_and_save_hits(file_path, train_proc)
+                train_bar.progress((index + 1) / len(train_wavs))
 
             with st.spinner('Extracting features from Training Data...'):
                 X_train_full, y_train_full = create_dataset(train_proc)
@@ -113,32 +121,30 @@ if train_files and test_files:
             # --- Step B: Process Unseen Test Data ---
             st.write("### ⚙️ Processing Unseen Test Data...")
             test_bar = st.progress(0)
-            test_files_list = os.listdir(test_raw)
-            for index, file in enumerate(test_files_list):
-                split_and_save_hits(os.path.join(test_raw, file), test_proc)
-                test_bar.progress((index + 1) / len(test_files_list))
+            test_wavs = get_all_wav_paths(test_raw)
+
+            for index, file_path in enumerate(test_wavs):
+                split_and_save_hits(file_path, test_proc)
+                test_bar.progress((index + 1) / len(test_wavs))
 
             with st.spinner('Extracting features from Test Data...'):
                 X_unseen, y_unseen = create_dataset(test_proc)
 
             if len(X_train_full) == 0 or len(X_unseen) == 0:
-                st.error("Missing audio features. Please check the uploaded files.")
+                st.error("Missing audio features. Please check the uploaded zip files.")
             else:
                 st.success("All data processed successfully!")
 
                 # --- Step C: Model Training & Evaluation ---
-                # Split Training Data into Train (70%) and Validation (30%)
                 X_train, X_val, y_train, y_val = train_test_split(
                     X_train_full, y_train_full, test_size=0.3, random_state=42, stratify=y_train_full
                 )
 
-                # Scale Data
                 scaler = StandardScaler()
                 X_train_scaled = scaler.fit_transform(X_train)
                 X_val_scaled = scaler.transform(X_val)
                 X_unseen_scaled = scaler.transform(X_unseen)
 
-                # Setup model data based on selection
                 if model_choice == "Decision Tree":
                     model = DecisionTreeClassifier(random_state=42)
                     t_data, v_data, u_data = X_train, X_val, X_unseen
@@ -148,10 +154,8 @@ if train_files and test_files:
                     elif model_choice == "Logistic Regression": model = LogisticRegression(random_state=42, max_iter=1000)
                     else: model = SVC(random_state=42)
 
-                # Train
                 model.fit(t_data, y_train)
 
-                # Predict Accuracies
                 acc_train = accuracy_score(y_train, model.predict(t_data))
                 acc_val = accuracy_score(y_val, model.predict(v_data))
                 acc_unseen = accuracy_score(y_unseen, model.predict(u_data))
@@ -160,13 +164,11 @@ if train_files and test_files:
                 st.write("---")
                 st.write(f"## 📊 Results: {model_choice}")
 
-                # Display Metrics
                 m1, m2, m3 = st.columns(3)
                 m1.metric("Training Accuracy", f"{acc_train:.2%}")
                 m2.metric("Validation Accuracy", f"{acc_val:.2%}")
                 m3.metric("Unseen Test Accuracy", f"{acc_unseen:.2%}")
 
-                # Display Confusion Matrices
                 st.write("### Confusion Matrices")
                 c1, c2, c3 = st.columns(3)
 
